@@ -1,0 +1,67 @@
+services:
+  whisper:
+    image: onerahmet/openai-whisper-asr-webservice:latest
+    container_name: whisper-service
+    restart: unless-stopped  # 自动重启策略
+    ports:
+      - "9000:9000"
+    environment:
+      # 基础配置
+      - ASR_ENGINE=faster_whisper        # 使用 faster_whisper 引擎
+      - ASR_MODEL=small                   # 模型大小: tiny, base, small, medium, large
+      - ASR_MODEL_DIR=/models            # 模型存储目录
+
+      # 语言和任务配置
+      - LANGUAGE=auto                    # 自动检测语言，也可指定如 'zh' 'en' 等
+      - TASK=transcribe                  # transcribe 或 translate
+
+      # 输出配置
+      - OUTPUT_DIR=/output               # 输出目录
+      - SAVE_TRANSCRIPTION=true          # 保存转录文件
+      - OUTPUT_FORMAT=all                # 输出格式: txt,vtt,srt,json,tsv,all
+      - RESULT_DIR=/output              # 添加结果目录配置
+      - LOG_DIR=/logs
+
+      # 性能优化
+      - COMPUTE_TYPE=int8                # 计算类型: float32,float16,int8
+      - BEAM_SIZE=5                      # beam search 大小，更大更准但更慢
+      - BATCH_SIZE=16                    # 批处理大小，根据内存调整
+      - CPU_THREADS=4                    # CPU 线程数
+      - NUM_WORKERS=2                    # worker 进程数
+
+      # 高级功能
+      - WORD_TIMESTAMPS=true             # 是否生成单词级时间戳
+      - VAD_FILTER=true                  # 是否使用语音活动检测
+      - VAD_THRESHOLD=0.5                # VAD 阈值
+      - INITIAL_PROMPT=""                # 初始提示词
+
+      # API 限制
+      - MAX_FILE_SIZE=100               # 最大文件大小(MB)
+      - RATE_LIMIT=100                  # 速率限制(每分钟请求数)
+
+      # 日志配置
+      - LOG_LEVEL=DEBUG                  # 日志级别: DEBUG,INFO,WARNING,ERROR
+
+    volumes:
+      # 持久化存储
+      - whisper_models:/models          # 模型文件持久化
+      - ./transcripts:/output          # 转录结果输出到本地目录
+      - ./audio:/audio                 # 音频文件目录（可选）
+      - ./logs:/logs                   # 日志目录
+
+    deploy:
+      resources:
+        limits:
+          memory: 12G                   # 内存限制
+        reservations:
+          memory: 1G                   # 内存预留
+
+    healthcheck:                       # 健康检查
+      test: ["CMD", "curl", "-f", "http://localhost:9000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  whisper_models:
+    name: whisper_models               # 指定 volume 名称
