@@ -1,0 +1,8 @@
+.env
+# 生成的数据与模型缓存
+/data/
+/audio/
+/logs/
+/transcripts/
+# Python 缓存
+__pycache__/
