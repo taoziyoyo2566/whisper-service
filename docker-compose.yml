@@ -15,6 +15,7 @@ services:
       - BEAM_SIZE=3
       - BATCH_SIZE=8
     volumes:
+      - ./patches/whisper-utils.py:/app/app/utils.py:ro
       - ./data/models:/root/.cache/whisper  # 缓存模型，避免重复下载
     healthcheck:
       test:
