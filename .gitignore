@@ -1,8 +1,10 @@
 .env
 # 生成的数据与模型缓存
 /data/
-/audio/
 /logs/
-/transcripts/
+# 运行态/本地配置
+/alist-data/
+/n8n-data/
+/postgres-data/
 # Python 缓存
 __pycache__/

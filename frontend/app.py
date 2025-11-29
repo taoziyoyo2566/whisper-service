@@ -1,15 +1,19 @@
-import json
 import os
-from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
+import requests
 import streamlit as st
 
-DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data/media"))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+ALIST_API_URL = os.getenv("ALIST_API_URL", "http://alist:5244").rstrip("/")
+ALIST_TOKEN = os.getenv("ALIST_TOKEN", "")
+WORKER_API_URL = os.getenv("WORKER_API_URL", "http://worker:5000").rstrip("/")
+WORKER_SECRET = os.getenv("WORKER_SECRET", "")
+ALLOWED_PATH_PREFIX = os.getenv("ALLOWED_PATH_PREFIX", "/guest_upload").strip() or "/guest_upload"
+if not ALLOWED_PATH_PREFIX.startswith("/"):
+    ALLOWED_PATH_PREFIX = f"/{ALLOWED_PATH_PREFIX}"
+ALLOWED_PATH_PREFIX = ALLOWED_PATH_PREFIX.rstrip("/")
 
-META_SUFFIX = ".meta.json"
 MEDIA_EXTENSIONS = {
     ".mp3",
     ".wav",
@@ -26,172 +30,227 @@ MEDIA_EXTENSIONS = {
     ".m4v",
     ".webm",
 }
-RESULT_SUFFIXES = [".srt", ".txt", ".json", ".vtt"]
-MIME_MAP = {
-    ".srt": "text/plain",
-    ".txt": "text/plain",
-    ".json": "application/json",
-    ".vtt": "text/vtt",
-}
+RESULT_SUFFIXES = [".vtt", ".srt", ".txt"]
+REQUEST_TIMEOUT = (5, 30)
 
-def trigger_rerun():
+
+def detect_mode(path: str) -> str:
+    lower = path.lower()
+    if "/fast/" in lower:
+        return "fast"
+    if "/best/" in lower:
+        return "best"
+    if "/translate/" in lower:
+        return "translate"
+    return "default"
+
+
+def format_size_mb(size: int) -> str:
+    if not size:
+        return "0.00"
+    return f"{size / (1024 * 1024):.2f}"
+
+
+def alist_request(method: str, endpoint: str, **kwargs):
+    headers = kwargs.pop("headers", {}) or {}
+    if ALIST_TOKEN:
+        headers["Authorization"] = ALIST_TOKEN
     try:
-        st.rerun()
-    except AttributeError:
-        st.experimental_rerun()
+        resp = requests.request(
+            method,
+            f"{ALIST_API_URL}{endpoint}",
+            headers=headers,
+            timeout=REQUEST_TIMEOUT,
+            **kwargs,
+        )
+    except Exception:
+        return None
+    if resp.status_code != 200:
+        return None
+    try:
+        return resp.json()
+    except ValueError:
+        return None
 
 
-def list_media_files():
-    files = []
-    for entry in DATA_DIR.iterdir():
-        if not entry.is_file():
-            continue
-        suffix = entry.suffix.lower()
-        if suffix in MEDIA_EXTENSIONS:
-            files.append(entry)
-    return sorted(files, key=lambda p: p.name.lower())
+@st.cache_data(ttl=5)
+def list_directory(path: str) -> list[dict]:
+    payload = alist_request("POST", "/api/fs/list", json={"path": path, "page": 1, "per_page": 500})
+    if not payload or payload.get("code") != 200:
+        return []
+    return payload.get("data", {}).get("content", []) or []
 
 
-def get_file_status(filename: str) -> str:
-    meta_path = DATA_DIR / f"{filename}{META_SUFFIX}"
-    if meta_path.exists():
-        try:
-            with meta_path.open("r", encoding="utf-8") as handle:
-                return json.load(handle).get("status", "unknown")
-        except json.JSONDecodeError:
-            return "error"
-    return "ready"
-
-
-def create_task(filename: str, config: dict) -> None:
-    meta = {
-        "filename": filename,
-        "status": "pending",
-        "created_at": datetime.utcnow().isoformat(),
-        "config": config,
-    }
-    tmp = DATA_DIR / f"{filename}{META_SUFFIX}.tmp"
-    final_path = DATA_DIR / f"{filename}{META_SUFFIX}"
-    with tmp.open("w", encoding="utf-8") as handle:
-        json.dump(meta, handle, ensure_ascii=False, indent=2)
-    tmp.replace(final_path)
-
-
-def discover_results(filename: str):
-    stem = Path(filename).stem
-    found = []
-    for suffix in RESULT_SUFFIXES:
-        candidate = DATA_DIR / f"{stem}{suffix}"
-        if candidate.exists():
-            found.append(candidate)
-    return found
-
-
-st.set_page_config(page_title="Whisper 字幕工场", layout="wide")
-st.title("🎙️ 本地化 Whisper 字幕生成系统")
-
-# --- 上传入口 ---
-tab_upload, tab_tasks = st.tabs(["📤 上传新文件", "🗃️ 文件库与任务队列"])
-
-with tab_upload:
-    uploaded = st.file_uploader(
-        "上传音频/视频文件", type=[ext.strip(".") for ext in MEDIA_EXTENSIONS]
-    )
-    if uploaded and st.button("保存到服务器"):
-        save_path = DATA_DIR / uploaded.name
-        with save_path.open("wb") as handle:
-            handle.write(uploaded.getbuffer())
-        st.success(f"文件 {uploaded.name} 已保存，前往文件库发起任务。")
-
-with tab_tasks:
-    if st.button("🔄 刷新列表"):
-        trigger_rerun()
-
-    files = list_media_files()
-    if files:
-        rows = []
-        for file_path in files:
-            size_mb = file_path.stat().st_size / (1024 * 1024)
-            rows.append(
+@st.cache_data(ttl=5)
+def load_media_index() -> list[dict]:
+    records: list[dict] = []
+    targets = [ALLOWED_PATH_PREFIX] + [
+        f"{ALLOWED_PATH_PREFIX}/{name}" for name in ("fast", "best", "translate")
+    ]
+    for folder in targets:
+        entries = list_directory(folder)
+        by_name = {item.get("name"): item for item in entries if item.get("name")}
+        for name, meta in by_name.items():
+            if meta.get("is_dir") or meta.get("type") == 1:
+                continue
+            ext = Path(name).suffix.lower()
+            if ext not in MEDIA_EXTENSIONS:
+                continue
+            stem = Path(name).stem
+            status = "ready"
+            outputs = {}
+            if f"{name}.processing" in by_name:
+                status = "processing"
+            if f"{name}.❌失败.txt" in by_name:
+                status = "failed"
+            for suffix in RESULT_SUFFIXES:
+                out_name = f"{stem}{suffix}"
+                if out_name in by_name:
+                    outputs[suffix.lstrip(".")] = f"{folder}/{out_name}"
+            if outputs and status == "ready":
+                status = "completed"
+            records.append(
                 {
-                    "文件名": file_path.name,
-                    "大小 (MB)": f"{size_mb:.2f}",
-                    "状态": get_file_status(file_path.name),
+                    "path": f"{folder}/{name}",
+                    "name": name,
+                    "dir": folder,
+                    "status": status,
+                    "mode": detect_mode(folder),
+                    "size": meta.get("size", 0),
+                    "modified": meta.get("modified", ""),
+                    "outputs": outputs,
                 }
             )
-        df = pd.DataFrame(rows)
-        df["选择"] = False
+    return records
 
-        editor = st.data_editor(
-            df,
-            column_config={
-                "选择": st.column_config.CheckboxColumn(required=True),
-                "状态": st.column_config.TextColumn(
-                    help="ready:待添加, pending:排队中, processing:处理中, completed:已完成"
-                ),
-            },
-            hide_index=True,
-            disabled=["文件名", "大小 (MB)", "状态"],
-            use_container_width=True,
+
+@st.cache_data(ttl=60)
+def get_download_url(path: str) -> str | None:
+    payload = alist_request("POST", "/api/fs/get", json={"path": path})
+    if not payload or payload.get("code") != 200:
+        return None
+    return payload.get("data", {}).get("raw_url")
+
+
+def queue_task(path: str) -> tuple[int | None, dict]:
+    headers = {}
+    if WORKER_SECRET:
+        headers["Authorization"] = f"Bearer {WORKER_SECRET}"
+    try:
+        resp = requests.post(
+            f"{WORKER_API_URL}/transcribe",
+            json={"path": path},
+            headers=headers,
+            timeout=REQUEST_TIMEOUT,
         )
+        try:
+            body = resp.json()
+        except ValueError:
+            body = {"error": resp.text}
+        return resp.status_code, body
+    except Exception as exc:
+        return None, {"error": str(exc)}
 
-        with st.expander("⚙️ 任务参数配置", expanded=True):
-            col1, col2 = st.columns(2)
-            task_options = {
-                "transcribe": "转录 (transcribe)",
-                "translate": "翻译成英文 (translate)",
-            }
-            task_choice = col1.selectbox(
-                "任务类型",
-                options=list(task_options.keys()),
-                format_func=lambda key: task_options[key],
-            )
-            output_formats = col2.multiselect(
-                "输出格式",
-                options=["srt", "txt", "json", "vtt"],
-                default=["srt", "txt"],
-            )
 
-        if st.button("🚀 开始处理选中的文件"):
-            selected_files = editor[editor["选择"] == True]["文件名"].tolist()
-            formats = output_formats or ["srt"]
-            queued = 0
-            for fname in selected_files:
-                current_status = get_file_status(fname)
-                if current_status in {"ready", "completed", "failed"}:
-                    create_task(
-                        fname,
-                        {
-                            "task": task_choice,
-                            "output_formats": formats,
-                        },
-                    )
-                    queued += 1
-            if queued:
-                st.success(f"已将 {queued} 个任务加入队列。")
-                trigger_rerun()
+def status_badge(status: str) -> str:
+    mapping = {
+        "ready": "🟢 ready",
+        "processing": "🟡 processing",
+        "completed": "✅ completed",
+        "failed": "❌ failed",
+    }
+    return mapping.get(status, status)
+
+
+st.set_page_config(page_title="Whisper 自动化控制台", layout="wide")
+st.title("🎙️ Whisper 自动化控制台")
+st.caption("Alist + Worker 队列（根据 fast/best/translate 自动选模型）")
+
+if st.button("🔄 刷新列表", type="secondary"):
+    load_media_index.clear()
+    get_download_url.clear()
+    st.experimental_rerun()
+
+if not ALIST_TOKEN:
+    st.warning("未配置 ALIST_TOKEN，将无法读取 Alist 列表。")
+
+files = load_media_index()
+
+if not files:
+    st.info("未在 Alist 中发现媒体文件（检查目录或 Token）。")
+    st.stop()
+
+rows = []
+for item in files:
+    rows.append(
+        {
+            "选择": False,
+            "文件名": item["name"],
+            "目录": item["dir"],
+            "模式": item["mode"],
+            "状态": status_badge(item["status"]),
+            "大小 (MB)": format_size_mb(item["size"]),
+            "修改时间": item["modified"],
+            "路径": item["path"],
+        }
+    )
+
+df = pd.DataFrame(rows)
+editor = st.data_editor(
+    df,
+    column_config={
+        "选择": st.column_config.CheckboxColumn(required=False),
+        "路径": st.column_config.TextColumn(help="Worker 处理的完整路径"),
+    },
+    hide_index=True,
+    disabled=["文件名", "目录", "模式", "状态", "大小 (MB)", "修改时间", "路径"],
+    use_container_width=True,
+)
+
+selected_paths = editor[editor["选择"] == True]["路径"].tolist()
+
+col_left, col_right = st.columns([1, 2])
+with col_left:
+    if st.button("🚀 提交到 Worker", disabled=not selected_paths):
+        results = []
+        for path in selected_paths:
+            code, body = queue_task(path)
+            results.append((path, code, body))
+        for path, code, body in results:
+            if code == 200:
+                st.success(f"{path} 已入队 (job_id: {body.get('job_id')})")
+            elif code == 409:
+                st.warning(f"{path} 已在队列中")
             else:
-                st.warning("所选文件没有可提交的任务。")
+                st.error(f"{path} 提交失败 ({code}): {body}")
 
-        st.divider()
-        st.write("#### 📥 结果下载")
-        completed_files = [row["文件名"] for row in rows if get_file_status(row["文件名"]) == "completed"]
-        if completed_files:
-            selected = st.selectbox("选择已完成的文件", completed_files)
-            if selected:
-                assets = discover_results(selected)
-                if assets:
-                    for asset in assets:
-                        with asset.open("rb") as handle:
-                            st.download_button(
-                                f"下载 {asset.name}",
-                                handle,
-                                file_name=asset.name,
-                                mime=MIME_MAP.get(asset.suffix.lower(), "text/plain"),
-                            )
-                else:
-                    st.info("该文件尚未生成输出，稍后再试。")
-        else:
-            st.info("暂无已完成的任务。")
-    else:
-        st.info("目录中没有音频/视频文件，请先上传。")
+with col_right:
+    st.write("选择文件以查看详情/下载：")
+    selected_detail = st.selectbox(
+        "文件",
+        options=[item["path"] for item in files],
+        format_func=lambda p: next((f["name"] for f in files if f["path"] == p), p),
+    )
+    if selected_detail:
+        detail = next((f for f in files if f["path"] == selected_detail), None)
+        if detail:
+            st.write(f"状态: {status_badge(detail['status'])} | 模式: {detail['mode']}")
+            raw_url = get_download_url(detail["path"])
+            if raw_url:
+                st.markdown(f"[播放/下载原文件]({raw_url})")
+            if detail["status"] == "failed":
+                fail_path = f"{detail['path']}.❌失败.txt"
+                fail_url = get_download_url(fail_path)
+                if fail_url:
+                    st.markdown(f"[查看失败原因]({fail_url})")
+            if detail["outputs"]:
+                st.write("输出文件：")
+                for label, out_path in detail["outputs"].items():
+                    out_url = get_download_url(out_path)
+                    if out_url:
+                        st.markdown(f"- [{label.upper()}]({out_url})")
+            else:
+                st.info("尚未生成输出文件。")
+
+st.divider()
+st.caption("提示：通过 Alist Web 界面/WebDAV 上传到 /guest_upload/{fast|best|translate}，再在此入队。")

@@ -1,453 +1,429 @@
-这是一个基于 **Streamlit (前端交互) + Sidecar JSON (状态管理) + Python Worker (后台队列)** 的完整落地执行方案。
+这是一个非常棒的思路。既然我们有了 **n8n** 这个强大的流程编排工具，接入各种通知渠道其实非常简单。
 
-该方案针对 **8核 16G 纯 CPU 服务器** 进行了优化，采用 **Faster-Whisper INT8 量化** 技术，确保在无显卡的情况下也能获得约 **4-5倍** 于官方模型的推理速度。
+**核心原则：让 Python Worker 专注于“干活”，让 n8n 专注于“发消息”。**
+
+你提到的 Telegram、WhatsApp、Line、WeChat（企业微信）等，n8n 都支持。
+
+  * **原生支持（最简单）**：Telegram, Email, Microsoft Teams, Slack, Discord.
+  * **Webhook 支持（很简单）**：钉钉 (DingTalk), 飞书 (Feishu), 企业微信 (WeChat Work).
+  * **API 支持（稍麻烦）**：WhatsApp (需要 Meta 开发者账号), Line (需要申请 Notify Token), 个人微信 (极难，不建议，建议用企业微信).
+
+为了让方案最通用，我在架构中设计了一个 **“回调机制”**：
+
+1.  Worker 处理完视频后，会主动给 n8n 发一个信号（Webhook）。
+2.  n8n 收到信号后，根据你拖拽的节点，自动把消息发给钉钉、飞书、Telegram 或邮件。
 
 -----
 
-# 🚀 本地化 Whisper 智能字幕生成系统执行方案
+以下是为您生成的 **最终执行方案 (Markdown)**。这是一份可以直接交付给技术人员部署，或者你自己复制粘贴就能跑通的完整指南。
 
-## 1\. 系统架构图解
+# 🚀 Whisper 自动化字幕工厂 (Pro版) - 完整部署指南
 
-```mermaid
-graph TD
-    User[用户 (浏览器)] -->|1. 上传/选择文件| Streamlit
-    Streamlit -->|2. 生成任务元数据.meta.json| SharedVol((共享存储 /data))
-    
-    Worker -->|3. 轮询发现 Pending 任务| SharedVol
-    Worker -->|4. 发送推理请求| WhisperAPI
-    
-    WhisperAPI -->|5. 返回识别文本| Worker
-    Worker -->|6. 生成 SRT/TXT 并更新状态| SharedVol
-    
-    Streamlit -->|7. 读取状态与下载成品| SharedVol
+本方案基于 **Docker + Alist + n8n + Whisper** 架构。
+
+### ✨ 核心功能亮点
+
+1.  **全自动流式处理**：视频在服务器内部流转，无需本地下载再上传。
+2.  **智能参数控制**：
+      * 把视频拖进 `/fast` 文件夹 -\> **极速模式** (Base模型)。
+      * 把视频拖进 `/best` 文件夹 -\> **高精模式** (Large模型)。
+      * 把视频拖进 `/translate` 文件夹 -\> **翻译模式** (自动翻译成英文)。
+3.  **所见即所得**：自动生成 VTT 字幕，Alist 网页端点击视频**直接播放带字幕版**。
+4.  **全渠道通知**：任务完成后，自动发送消息到 **钉钉、飞书、Telegram、邮件**。
+
+-----
+
+## 🛠️ 第一步：服务器基础环境
+
+确保你的服务器安装了 Docker 和 Docker Compose。
+
+```bash
+# 创建项目目录
+mkdir -p /opt/whisper-system
+cd /opt/whisper-system
+
+# 创建子目录
+mkdir -p alist-data n8n-data worker models
 ```
 
 -----
 
-## 2\. 目录结构准备
+## 📄 第二步：配置文件编写
 
-在服务器上创建项目目录 `/opt/whisper-system`，并建立以下文件结构：
-
-/opt/whisper-system/
-├── docker-compose.yml
-├──.env                       \# 环境变量配置
-├── frontend/                  \# Streamlit 前端代码
-│   ├── Dockerfile
-│   ├── app.py
-│   └──.streamlit/
-│       └── config.toml        \# 解除上传限制
-├── worker/                    \# 后台处理脚本
-│   ├── Dockerfile
-│   └── worker.py
-└── data/                      \# 数据挂载目录 (自动生成)
-├── media/                 \# 存放音频/视频源文件
-└── models/                \# 存放 Whisper 模型缓存
-
------
-
-## 3\. 核心配置文件编写
-
-### 3.1 Docker Compose 编排 (`docker-compose.yml`)
-
-此配置定义了三个服务，核心在于通过共享 `/data` 卷打通数据流。
+### 1\. `docker-compose.yml`
 
 ```yaml
 services:
-  # 1. 推理核心：提供 HTTP API
+  # 1. Alist: 网盘管理与播放器
+  alist:
+    image: xhofe/alist:latest
+    container_name: alist
+    restart: always
+    volumes:
+      - ./alist-data:/opt/alist/data
+    ports:
+      - "5244:5244"
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - UMASK=022
+
+  # 2. n8n: 任务编排与通知中心
+  n8n:
+    image: docker.n8n.io/n8nio/n8n
+    container_name: n8n
+    restart: always
+    ports:
+      - "5678:5678"
+    environment:
+      - N8N_SECURE_COOKIE=false
+      - WEBHOOK_URL=http://n8n:5678/
+    volumes:
+      - ./n8n-data:/home/node/.n8n
+
+  # 3. Whisper Service: 推理引擎
   whisper-service:
     image: onerahmet/openai-whisper-asr-webservice:latest
     container_name: whisper-core
     restart: unless-stopped
-    environment:
-      - ASR_ENGINE=faster_whisper   # 关键：使用 CTranslate2 加速引擎
-      - ASR_MODEL=medium            # CPU 推荐 medium，平衡速度与精度
-      - ASR_QUANTIZATION=int8       # CPU 必须开启 int8 量化，速度提升显著
-      - ASR_DEVICE=cpu
-    volumes:
-      -./data/models:/root/.cache/whisper
-    healthcheck:
-      test:
-      interval: 30s
-      timeout: 10s
-      retries: 5
-
-  # 2. 前端交互：Streamlit Web UI
-  webapp:
-    build:./frontend
-    container_name: whisper-webui
-    restart: unless-stopped
     ports:
-      - "8501:8501"
-    volumes:
-      -./data/media:/app/data/media  # 挂载媒体目录
+      - "9000:9000"
     environment:
-      - DATA_DIR=/app/data/media
-    depends_on:
-      - whisper-service
+      - ASR_ENGINE=faster_whisper
+      - ASR_MODEL=medium            # 默认模型
+      - ASR_QUANTIZATION=int8       # 省内存关键配置
+      - ASR_VAD_FILTER=true         # 过滤静音
+    volumes:
+      - ./models:/root/.cache/whisper
 
-  # 3. 任务队列：后台 Worker
+  # 4. Worker: 核心业务逻辑
   worker:
-    build:./worker
+    build: 
+      context: ./worker
     container_name: whisper-worker
-    restart: unless-stopped
-    volumes:
-      -./data/media:/app/data/media  # 必须与前端挂载一致
+    restart: always
+    ports:
+      - "5000:5000"
     environment:
+      - ALIST_API_URL=http://alist:5244
       - WHISPER_API_URL=http://whisper-service:9000
-      - DATA_DIR=/app/data/media
-      - POLLING_INTERVAL=5
+      # 这里先留空，等 n8n 设置好后再填入回调地址
+      - N8N_CALLBACK_URL=http://n8n:5678/webhook/callback
+    env_file:
+      - .env
     depends_on:
+      - alist
       - whisper-service
 ```
 
-### 3.2 前端实现 (`frontend/`)
+### 2\. `.env` 文件
 
-**`frontend/Dockerfile`**:
-
-```dockerfile
-FROM python:3.9-slim
-WORKDIR /app
-RUN pip install streamlit pandas watchdog
-COPY..
-CMD ["streamlit", "run", "app.py"]
+```bash
+nano .env
 ```
 
-**`frontend/.streamlit/config.toml`** (解决大文件上传限制):
+写入以下内容（`ALIST_TOKEN` 等启动后再填）：
 
-```toml
-[server]
-maxUploadSize = 2000  # 允许 2GB 上传
-address = "0.0.0.0"
-```
-
-**`frontend/app.py`**:
-
-```python
-import streamlit as st
-import os
-import json
-import pandas as pd
-from datetime import datetime
-import shutil
-
-# 配置
-DATA_DIR = os.getenv("DATA_DIR", "/app/data/media")
-os.makedirs(DATA_DIR, exist_ok=True)
-
-st.set_page_config(page_title="Whisper 字幕工场", layout="wide")
-st.title("🎙️ 本地化 Whisper 字幕生成系统")
-
-# --- 工具函数 ---
-def get_file_status(filename):
-    meta_path = os.path.join(DATA_DIR, f"{filename}.meta.json")
-    if os.path.exists(meta_path):
-        try:
-            with open(meta_path, 'r') as f:
-                return json.load(f).get("status", "unknown")
-        except:
-            return "error"
-    return "ready" # 未处理
-
-def create_task(filename, config):
-    meta = {
-        "filename": filename,
-        "status": "pending",
-        "created_at": datetime.now().isoformat(),
-        "config": config
-    }
-    # 原子写入：先写临时文件再重命名，防止 Worker 读到半截文件
-    temp_path = os.path.join(DATA_DIR, f"{filename}.meta.tmp")
-    final_path = os.path.join(DATA_DIR, f"{filename}.meta.json")
-    with open(temp_path, 'w') as f:
-        json.dump(meta, f)
-    os.rename(temp_path, final_path)
-
-# --- 页面布局 ---
-tab1, tab2 = st.tabs(["📤 上传新文件", "🗃️ 文件库与任务队列"])
-
-with tab1:
-    uploaded_file = st.file_uploader("上传视频/音频文件", type=['mp4', 'mkv', 'mp3', 'wav', 'm4a'])
-    if uploaded_file:
-        if st.button("保存到服务器"):
-            save_path = os.path.join(DATA_DIR, uploaded_file.name)
-            with open(save_path, "wb") as f:
-                f.write(uploaded_file.getbuffer())
-            st.success(f"文件 {uploaded_file.name} 已保存！请去文件库添加任务。")
-
-with tab2:
-    st.write("### 服务器文件列表")
-    if st.button("🔄 刷新列表"):
-        st.rerun()
-
-    # 扫描文件
-    files =
-    files.sort()
-
-    data =
-    for f in files:
-        status = get_file_status(f)
-        data.append({"文件名": f, "状态": status})
-
-    df = pd.DataFrame(data)
-    
-    # 交互式表格
-    if not df.empty:
-        # 使用 data_editor 允许勾选
-        df["选择"] = False
-        edited_df = st.data_editor(
-            df, 
-            column_config={
-                "选择": st.column_config.CheckboxColumn(required=True),
-                "状态": st.column_config.TextColumn(help="ready:待添加, pending:排队中, processing:处理中, completed:已完成")
-            },
-            disabled=["文件名", "状态"],
-            hide_index=True,
-        )
-
-        # 任务配置区
-        with st.expander("⚙️ 任务参数配置", expanded=True):
-            col1, col2 = st.columns(2)
-            task_type = col1.selectbox("任务类型", ["transcribe (转录)", "translate (翻译成英文)"], index=0)
-            out_fmt = col2.multiselect("输出格式", ["srt", "txt", "json", "vtt"], default=["srt", "txt"])
-
-        # 批量提交按钮
-        if st.button("🚀 开始处理选中的文件"):
-            selected_files = edited_df[edited_df["选择"] == True]["文件名"].tolist()
-            count = 0
-            for fname in selected_files:
-                # 仅对未处理或已完成（重新生成）的文件操作，跳过正在处理的
-                current_status = get_file_status(fname)
-                if current_status in ["ready", "completed", "failed"]:
-                    config = {
-                        "task": task_type.split(),
-                        "output_formats": out_fmt
-                    }
-                    create_task(fname, config)
-                    count += 1
-            
-            if count > 0:
-                st.success(f"已将 {count} 个任务加入队列！")
-                st.rerun()
-            else:
-                st.warning("没有选择有效的文件，或文件正在处理中。")
-                
-        # 结果下载区 (简单的文件链接)
-        st.divider()
-        st.write("#### 📥 结果下载")
-        selected_download = st.selectbox("选择要下载的结果", [f for f in files if get_file_status(f) == "completed"])
-        if selected_download:
-            base_name = os.path.splitext(selected_download)
-            # 寻找生成的 SRT/TXT
-            results =
-            for res in results:
-                with open(os.path.join(DATA_DIR, res), "rb") as f:
-                    st.download_button(f"下载 {res}", f, file_name=res)
-
-    else:
-        st.info("暂无文件，请先上传。")
-```
-
-### 3.3 后台 Worker 实现 (`worker/`)
-
-**`worker/Dockerfile`**:
-
-```dockerfile
-FROM python:3.9-slim
-WORKDIR /app
-RUN pip install requests
-COPY..
-CMD ["python", "-u", "worker.py"]
-```
-
-**`worker/worker.py`**:
-
-```python
-import os
-import time
-import json
-import requests
-import datetime
-
-# 配置
-WHISPER_URL = os.getenv("WHISPER_API_URL", "http://whisper-service:9000") + "/asr"
-DATA_DIR = os.getenv("DATA_DIR", "/app/data/media")
-POLLING_INTERVAL = int(os.getenv("POLLING_INTERVAL", 5))
-
-print(f"Worker 启动: 监听 {DATA_DIR}")
-
-def update_status(meta_path, meta_data, status, error=None):
-    meta_data["status"] = status
-    if status == "completed":
-        meta_data["completed_at"] = datetime.datetime.now().isoformat()
-    if error:
-        meta_data["error"] = str(error)
-    
-    with open(meta_path, 'w') as f:
-        json.dump(meta_data, f)
-
-def seconds_to_srt_time(seconds):
-    td = datetime.timedelta(seconds=seconds)
-    total_seconds = int(td.total_seconds())
-    hours = total_seconds // 3600
-    minutes = (total_seconds % 3600) // 60
-    secs = total_seconds % 60
-    millis = int(td.microseconds / 1000)
-    return f"{hours:02}:{minutes:02}:{secs:02},{millis:03}"
-
-def json_to_srt(json_data):
-    srt_content = ""
-    for idx, segment in enumerate(json_data.get('segments',), 1):
-        start = seconds_to_srt_time(segment['start'])
-        end = seconds_to_srt_time(segment['end'])
-        text = segment['text'].strip()
-        srt_content += f"{idx}\n{start} --> {end}\n{text}\n\n"
-    return srt_content
-
-def process_task(meta_file):
-    meta_path = os.path.join(DATA_DIR, meta_file)
-    
-    try:
-        with open(meta_path, 'r') as f:
-            meta = json.load(f)
-    except Exception as e:
-        print(f"读取元数据失败: {e}")
-        return
-
-    filename = meta.get("filename")
-    config = meta.get("config", {})
-    file_path = os.path.join(DATA_DIR, filename)
-
-    if not os.path.exists(file_path):
-        update_status(meta_path, meta, "failed", "源文件不存在")
-        return
-
-    print(f"开始处理: {filename}")
-    update_status(meta_path, meta, "processing")
-
-    try:
-        # 1. 调用 Whisper API
-        # 强制请求 JSON 格式，以便 Worker 在本地生成多种格式，减少 API 传输压力
-        params = {
-            'task': config.get('task', 'transcribe'),
-            'output': 'json',
-            'language': config.get('language') # 如果为 None 则自动检测
-        }
-        
-        # 移除 None 的参数
-        params = {k: v for k, v in params.items() if v is not None}
-
-        with open(file_path, 'rb') as f:
-            files = {'audio_file': f}
-            response = requests.post(WHISPER_URL, params=params, files=files, timeout=3600) # 1小时超时
-
-        if response.status_code!= 200:
-            raise Exception(f"API Error {response.status_code}: {response.text}")
-
-        result = response.json()
-        
-        # 2. 生成请求的输出格式
-        base_name = os.path.splitext(filename)
-        output_formats = config.get('output_formats', ['srt'])
-
-        if 'json' in output_formats:
-            with open(os.path.join(DATA_DIR, f"{base_name}.json"), 'w', encoding='utf-8') as f:
-                json.dump(result, f, ensure_ascii=False, indent=2)
-        
-        if 'txt' in output_formats:
-            with open(os.path.join(DATA_DIR, f"{base_name}.txt"), 'w', encoding='utf-8') as f:
-                f.write(result.get('text', ''))
-
-        if 'srt' in output_formats:
-            srt_content = json_to_srt(result)
-            with open(os.path.join(DATA_DIR, f"{base_name}.srt"), 'w', encoding='utf-8') as f:
-                f.write(srt_content)
-
-        update_status(meta_path, meta, "completed")
-        print(f"处理完成: {filename}")
-
-    except Exception as e:
-        print(f"处理异常: {e}")
-        update_status(meta_path, meta, "failed", str(e))
-
-def main():
-    while True:
-        # 扫描 pending 任务
-        tasks =
-        for f in os.listdir(DATA_DIR):
-            if f.endswith(".meta.json"):
-                try:
-                    with open(os.path.join(DATA_DIR, f), 'r') as jf:
-                        data = json.load(jf)
-                        if data.get("status") == "pending":
-                            tasks.append((f, data.get("created_at")))
-                except:
-                    pass
-        
-        # 按创建时间排序 (FIFO)
-        tasks.sort(key=lambda x: x[1])
-
-        if tasks:
-            # 取第一个任务处理
-            process_task(tasks)
-        else:
-            time.sleep(POLLING_INTERVAL)
-
-if __name__ == "__main__":
-    main()
+```env
+ALIST_TOKEN=
 ```
 
 -----
 
-## 4\. 部署与使用说明
+## 🐍 第三步：Worker 代码实现
 
-### 部署步骤
+这是系统的核心大脑。
 
-1.  将上述文件按目录结构保存。
-2.  在 `/opt/whisper-system` 目录下运行：
+```bash
+cd worker
+```
+
+### 1\. `Dockerfile`
+
+```dockerfile
+FROM python:3.10-slim
+WORKDIR /app
+RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY main.py .
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "1", "--threads", "8", "--timeout", "0", "main:app"]
+```
+
+### 2\. `requirements.txt`
+
+```text
+flask
+requests
+gunicorn
+```
+
+### 3\. `main.py` (完整逻辑)
+
+```python
+import os
+import json
+import requests
+import threading
+import logging
+import urllib.parse
+from flask import Flask, request, jsonify
+
+# 配置日志
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+
+# 环境变量
+ALIST_BASE_URL = os.getenv("ALIST_API_URL", "http://alist:5244")
+ALIST_TOKEN = os.getenv("ALIST_TOKEN", "")
+WHISPER_BASE_URL = os.getenv("WHISPER_API_URL", "http://whisper-service:9000")
+N8N_CALLBACK_URL = os.getenv("N8N_CALLBACK_URL", "")
+
+# --- 核心工具函数 ---
+
+def alist_put_file(file_path, content):
+    """上传文件到 Alist"""
+    file_path = "/" + file_path.lstrip("/") # 规范路径
+    url = f"{ALIST_BASE_URL}/api/fs/put"
+    headers = {
+        "Authorization": ALIST_TOKEN, 
+        "File-Path": urllib.parse.quote(file_path)
+    }
+    if isinstance(content, str): content = content.encode('utf-8')
+    try:
+        requests.put(url, headers=headers, data=content)
+    except Exception as e:
+        logger.error(f"Upload failed: {e}")
+
+def alist_delete_file(dir_path, filenames):
+    """删除临时文件"""
+    url = f"{ALIST_BASE_URL}/api/fs/remove"
+    headers = {"Authorization": ALIST_TOKEN, "Content-Type": "application/json"}
+    requests.post(url, headers=headers, json={"names": filenames, "dir": dir_path})
+
+def get_alist_download_url(file_path):
+    """获取下载直链"""
+    url = f"{ALIST_BASE_URL}/api/fs/get"
+    headers = {"Authorization": ALIST_TOKEN, "Content-Type": "application/json"}
+    try:
+        resp = requests.post(url, headers=headers, json={"path": file_path})
+        if resp.status_code == 200 and resp.json().get('code') == 200:
+            return resp.json()['data']['raw_url']
+    except Exception as e:
+        logger.error(f"Get URL failed: {e}")
+    return None
+
+def notify_n8n(status, file_name, message, output_dir):
+    """回调通知 n8n"""
+    if not N8N_CALLBACK_URL: return
+    try:
+        payload = {
+            "status": status,
+            "file": file_name,
+            "message": message,
+            "folder": output_dir,
+            "timestamp": os.popen('date -u +"%Y-%m-%dT%H:%M:%SZ"').read().strip()
+        }
+        requests.post(N8N_CALLBACK_URL, json=payload)
+    except Exception as e:
+        logger.error(f"Notification failed: {e}")
+
+# --- 转换逻辑 (VTT/SRT) ---
+
+def format_timestamp(seconds):
+    milliseconds = int(round(seconds * 1000))
+    hours = milliseconds // 3600000
+    milliseconds %= 3600000
+    minutes = milliseconds // 60000
+    milliseconds %= 60000
+    seconds = milliseconds // 1000
+    milliseconds %= 1000
+    return f"{hours:02}:{minutes:02}:{seconds:02}.{milliseconds:03}"
+
+def json_to_vtt(segments):
+    vtt = ["WEBVTT", ""]
+    for seg in segments:
+        vtt.append(f"{format_timestamp(seg['start'])} --> {format_timestamp(seg['end'])}")
+        vtt.append(f"{seg['text'].strip()}\n")
+    return "\n".join(vtt)
+
+def json_to_srt(segments):
+    srt = []
+    for i, seg in enumerate(segments, 1):
+        ts_start = format_timestamp(seg['start']).replace('.', ',')
+        ts_end = format_timestamp(seg['end']).replace('.', ',')
+        srt.append(f"{i}\n{ts_start} --> {ts_end}\n{seg['text'].strip()}\n")
+    return "\n".join(srt)
+
+# --- 异步任务 ---
+
+def run_task(file_path):
+    # 解析路径
+    if "/" in file_path:
+        output_dir = os.path.dirname(file_path)
+        file_name = os.path.basename(file_path)
+    else:
+        output_dir = "/"
+        file_name = file_path
+        
+    logger.info(f"Task Started: {file_name}")
+    status_file = f"{file_name}.🚧处理中"
+    alist_put_file(f"{output_dir}/{status_file}", b"Processing...")
+
+    try:
+        # 1. 智能参数路由
+        model = "medium"
+        task_type = "transcribe"
+        
+        path_lower = file_path.lower()
+        if "/fast" in path_lower: model = "base"
+        if "/best" in path_lower: model = "large-v3"
+        if "/translate" in path_lower: task_type = "translate"
+
+        # 2. 获取流地址
+        raw_url = get_alist_download_url(file_path)
+        if not raw_url: raise Exception("无法获取下载直链")
+
+        # 3. 流式推理
+        whisper_url = f"{WHISPER_BASE_URL}/asr"
+        params = {'task': task_type, 'output': 'json', 'model': model}
+        
+        with requests.get(raw_url, stream=True) as r:
+            r.raise_for_status()
+            files = {'audio_file': (file_name, r.raw, 'application/octet-stream')}
+            resp = requests.post(whisper_url, params=params, files=files, timeout=7200)
+            if resp.status_code != 200: raise Exception(f"API Error: {resp.text}")
+            result = resp.json()
+
+        # 4. 生成文件
+        base_name = os.path.splitext(file_name)[0]
+        segments = result.get('segments', [])
+        
+        # 写入 Alist
+        alist_put_file(f"{output_dir}/{base_name}.vtt", json_to_vtt(segments))
+        alist_put_file(f"{output_dir}/{base_name}.srt", json_to_srt(segments))
+        alist_put_file(f"{output_dir}/{base_name}.txt", result.get('text', ''))
+        
+        logger.info(f"Task Success: {file_name}")
+        notify_n8n("success", file_name, "字幕生成完成，可在线播放。", output_dir)
+
+    except Exception as e:
+        logger.error(f"Task Failed: {e}")
+        alist_put_file(f"{output_dir}/{file_name}.❌失败.txt", str(e))
+        notify_n8n("error", file_name, str(e), output_dir)
+
+    finally:
+        alist_delete_file(output_dir, [status_file])
+
+@app.route('/transcribe', methods=['POST'])
+def handle_request():
+    data = request.json
+    file_path = data.get('path')
+    if not file_path: return jsonify({"error": "No path"}), 400
+    
+    # 异步启动
+    threading.Thread(target=run_task, args=(file_path,)).start()
+    return jsonify({"status": "submitted"}), 200
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
+```
+
+-----
+
+## 🚀 第四步：启动与初始化
+
+1.  **启动 Alist**：
+    ```bash
+    docker-compose up -d alist
+    ```
+2.  **获取 Token**：
+      * 查看密码：`docker logs alist`
+      * 登录 `http://IP:5244` -\> 管理 -\> 设置 -\> 其他 -\> **复制令牌 (Token)**。
+3.  **填入 Token**：
+    编辑 `.env` 文件，填入 `ALIST_TOKEN`。
+4.  **启动全部服务**：
     ```bash
     docker-compose up -d --build
     ```
-3.  **首次启动注意**：服务启动后，`whisper-service` 会自动下载约 1.5GB 的 Medium 模型文件。这需要几分钟，期间前端可能会连接失败，请耐心等待。可以通过 `docker logs -f whisper-core` 查看下载进度。
-
-### 使用流程
-
-1.  **访问 Web UI**：浏览器打开 `http://你的服务器IP:8501`。
-2.  **上传/选择**：
-      * 方式 A：在 "上传新文件" 标签页上传小文件。
-      * 方式 B：直接通过 FTP/SMB 将几十 GB 的大文件放入 `/opt/whisper-system/data/media` 目录，点击 Web UI 上的 "刷新列表" 即可看到。
-3.  **发起任务**：在 "文件库" 标签页，勾选一个或多个文件，选择需要的格式（如 SRT），点击 "开始处理"。
-4.  **监控进度**：状态会从 `ready` -\> `pending` (排队) -\> `processing` (正在跑) -\> `completed` (完成)。
-5.  **下载**：任务完成后，下方会出现下载按钮，直接下载生成的 SRT 字幕。
 
 -----
 
-## 5\. 方案审查与自检 (Self-Correction)
+## 🔗 第五步：n8n 流程设置 (通知中心)
 
-在最终确定方案前，针对潜在问题进行了以下检查与优化：
+这是实现你“多渠道通知”的关键步骤。
 
-1.  **Streamlit 重新加载机制问题**：
+1.  打开 `http://IP:5678` 注册 n8n。
+2.  新建一个 Workflow，命名为 `Whisper Automation`。
 
-      * *隐患*：Streamlit 的复选框和按钮在页面刷新（Rerun）后状态容易丢失。
-      * *改进*：在 `app.py` 中使用了 `st.data_editor` (Streamlit 1.23+ 新特性)。相比传统的 checkbox 列表，`data_editor` 提供了更稳定的状态保持和更像 Excel 的操作体验，非常适合批量选择文件。
+### 1\. 触发任务流 (Start)
 
-2.  **大文件上传限制**：
+  * **节点 A (Webhook)**:
+      * Path: `transcribe`
+      * Method: `POST`
+      * *作用：接收用户提交的任务。*
+  * **节点 B (HTTP Request)**:
+      * URL: `http://worker:5000/transcribe`
+      * Method: `POST`
+      * Body: JSON `{ "path": "{{ $json.body.path }}" }`
+      * *作用：告诉 Worker 开始干活。*
 
-      * *隐患*：默认 Streamlit 限制 200MB。
-      * *改进*：已在 `config.toml` 中明确配置 `maxUploadSize = 2000` (2GB)。同时推荐用户直接将大文件拷贝到文件夹，这是 Web UI 无法替代的高效路径。
+### 2\. 通知回调流 (Callback)
 
-3.  **API 超时问题**：
+  * **节点 C (Webhook)**:
+      * Path: `callback`
+      * Method: `POST`
+      * *作用：接收 Worker 干完活后的汇报。*
+  * **节点 D (Switch)**:
+      * 判断 `status` 是 `success` 还是 `error`。
 
-      * *隐患*：CPU 处理长音频（如 2 小时电影）可能需要 30 分钟以上，普通的 HTTP 客户端默认超时是 60 秒。
-      * *改进*：在 `worker.py` 的 `requests.post` 中显式设置了 `timeout=3600` (1 小时)，防止 Worker 误判服务超时而中断。
+### 3\. 添加通知节点 (根据你的需求连接)
 
-4.  **并发冲突**：
+将 **节点 D (Switch)** 的输出连接到以下任意节点：
 
-      * *隐患*：如果有多个文件同时提交，Worker 是否会乱？
-      * *改进*：Worker 逻辑是单线程 `while True` 循环，严格串行处理。通过 `sort(key=created_at)` 保证了先来后到的 FIFO 顺序。这在 8核 CPU 上是最稳妥的策略，避免并行挤爆 CPU。
+  * **📱 钉钉 (DingTalk)**:
 
-5.  **文件读写竞争**：
+      * 添加 `HTTP Request` 节点。
+      * URL: 你的钉钉机器人 Webhook 地址。
+      * Body:
+        ```json
+        {
+          "msgtype": "text",
+          "text": { "content": "🎥 字幕任务完成！\n文件：{{ $json.body.file }}\n状态：{{ $json.body.message }}" }
+        }
+        ```
 
-      * *隐患*：Web UI 正在写 `.json` 时 Worker 刚好读取。
-      * *改进*：采用了 **Write temp -\> Rename** 的原子操作模式，彻底杜绝了读取到损坏 JSON 的可能性。
+  * **📘 飞书 (Feishu)**:
 
-该方案现在是闭环且健壮的。
+      * 添加 `HTTP Request` 节点。
+      * URL: 你的飞书机器人 Webhook。
+      * Body: `{"msg_type":"text","content":{"text":"字幕已生成: {{ $json.body.file }}"}}`
+
+  * **✈️ Telegram**:
+
+      * 直接添加 n8n 自带的 `Telegram` 节点。
+      * 填入 Bot Token 和 Chat ID。
+      * Text: `✅ 任务完成：{{ $json.body.file }}`
+
+  * **📧 邮件 (Email)**:
+
+      * 添加 `Send Email` 节点。
+      * 配置 SMTP（如 Gmail 或 QQ邮箱）。
+
+-----
+
+## 🎬 最终使用体验
+
+1.  **上传**：在 Alist 的 `/guest_upload/fast` 目录上传一个 `movie.mp4`。
+2.  **触发**：调用 n8n 的 webhook（或者做一个简单的 HTML 表单提交 URL）。
+3.  **反馈**：
+      * Alist 目录立即出现 `movie.mp4.🚧处理中`。
+      * 后台自动流式转录，极速模式。
+4.  **完成**：
+      * 手机 **钉钉/Telegram** 收到弹窗：“🎥 字幕任务完成！文件：movie.mp4”。
+      * 刷新 Alist，看到 `movie.vtt` 已生成。
+      * **点击 `movie.mp4`，直接开始带字幕播放。**
+
+这套方案完美覆盖了**存储、计算、多用户、多参数、多通知、在线预览**，且完全基于开源组件，无额外费用。

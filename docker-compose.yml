@@ -1,4 +1,92 @@
 services:
+  redis:
+    image: redis:8.4-alpine
+    container_name: redis
+    restart: unless-stopped
+    command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
+    volumes:
+      - ./data/redis:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - whisper-net
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres-db
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+    volumes:
+      - ./postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - whisper-net
+
+  alist:
+    image: xhofe/alist:v3.55.0
+    container_name: alist
+    restart: unless-stopped
+    ports:
+      - "5244:5244"
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - UMASK=022
+    volumes:
+      - ./alist-data:/opt/alist/data
+    healthcheck:
+      # Use wget because curl is not available in the image
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:5244/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - whisper-net
+
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:1.122.3
+    container_name: n8n
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    environment:
+      - N8N_SECURE_COOKIE=false
+      - WEBHOOK_URL=http://n8n:5678/
+      - GENERIC_TIMEZONE=${TZ}
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=${POSTGRES_DB}
+      - DB_POSTGRESDB_USER=${POSTGRES_USER}
+      - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - ./n8n-data:/home/node/.n8n
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      # Use wget because curl is not available in the image
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:5678/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - whisper-net
+
   whisper-service:
     image: onerahmet/openai-whisper-asr-webservice:latest
     container_name: whisper-core
@@ -6,17 +94,17 @@ services:
     ports:
       - "9000:9000"
     environment:
-      - ASR_ENGINE=faster_whisper           # 使用 CTranslate2 加速
-      - ASR_MODEL=medium                    # CPU 机型推荐 medium
+      - ASR_ENGINE=faster_whisper
+      - ASR_MODEL=medium
       - ASR_DEVICE=cpu
-      - ASR_QUANTIZATION=int8               # Faster-Whisper int8 量化
-      - ASR_THREADS=8                       # 与 8 核 CPU 对齐
+      - ASR_QUANTIZATION=int8
+      - ASR_VAD_FILTER=true
+      - ASR_THREADS=8
       - LOG_LEVEL=INFO
       - BEAM_SIZE=3
       - BATCH_SIZE=8
     volumes:
-      - ./patches/whisper-utils.py:/app/app/utils.py:ro
-      - ./data/models:/root/.cache/whisper  # 缓存模型，避免重复下载
+      - ./data/models:/root/.cache/whisper
     healthcheck:
       test:
         - CMD
@@ -28,9 +116,38 @@ services:
               urllib.request.urlopen("http://localhost:9000/", timeout=5).read()
           except Exception:
               sys.exit(1)
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - whisper-net
+
+  worker:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile
+    container_name: whisper-worker
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./logs:/app/logs
+    depends_on:
+      redis:
+        condition: service_healthy
+      whisper-service:
+        condition: service_healthy
+      alist:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
       interval: 30s
       timeout: 10s
       retries: 5
+    networks:
+      - whisper-net
 
   webapp:
     build:
@@ -42,24 +159,21 @@ services:
       - "8501:8501"
     environment:
       - DATA_DIR=/app/data/media
+      - ALIST_API_URL=http://alist:5244
+      - ALIST_TOKEN=${ALIST_TOKEN}
+      - WORKER_API_URL=http://worker:5000
+      - WORKER_SECRET=${WORKER_SECRET}
+      - ALLOWED_PATH_PREFIX=${ALLOWED_PATH_PREFIX}
     volumes:
       - ./data/media:/app/data/media
     depends_on:
       whisper-service:
         condition: service_healthy
+      alist:
+        condition: service_healthy
+    networks:
+      - whisper-net
 
-  worker:
-    build:
-      context: ./worker
-      dockerfile: Dockerfile
-    container_name: whisper-worker
-    restart: unless-stopped
-    environment:
-      - WHISPER_API_URL=http://whisper-service:9000
-      - DATA_DIR=/app/data/media
-      - POLLING_INTERVAL=5
-    volumes:
-      - ./data/media:/app/data/media
-    depends_on:
-      whisper-service:
-        condition: service_healthy
+networks:
+  whisper-net:
+    driver: bridge
