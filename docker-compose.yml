@@ -2,6 +2,7 @@ services:
   whisper-service:
     image: onerahmet/openai-whisper-asr-webservice:latest
     container_name: whisper-core
+    user: "${UID}:${GID}"
     restart: unless-stopped
     ports:
       - "9000:9000"
@@ -38,6 +39,7 @@ services:
       dockerfile: Dockerfile
     container_name: whisper-webui
     restart: unless-stopped
+    user: "${UID}:${GID}"
     ports:
       - "8501:8501"
     environment:
@@ -54,6 +56,7 @@ services:
       dockerfile: Dockerfile
     container_name: whisper-worker
     restart: unless-stopped
+    user: "${UID}:${GID}"
     environment:
       - WHISPER_API_URL=http://whisper-service:9000
       - DATA_DIR=/app/data/media
