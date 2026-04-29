@@ -1,0 +1,18 @@
+services:
+  whisper-service:
+    image: onerahmet/openai-whisper-asr-webservice:latest-gpu
+    environment:
+      - ASR_ENGINE=faster_whisper
+      - ASR_MODEL=large-v3
+      - ASR_DEVICE=cuda
+      - ASR_QUANTIZATION=float16
+      - LOG_LEVEL=INFO
+      - BEAM_SIZE=5
+      - BATCH_SIZE=16
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
